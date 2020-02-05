@@ -35,7 +35,7 @@ local function open_channel(t, key)
 		local host, port = string.match(address, "([^:]+):(.*)$")
 		c = node_sender[key]
 		if c == nil then
-			c = skynet.newservice("clustersender", key, nodename)
+			c = skynet.newservice("clustersender", key, nodename, host, port)
 			if node_sender[key] then
 				-- double check
 				skynet.kill(c)
@@ -133,6 +133,10 @@ end
 
 function command.sender(source, node)
 	skynet.ret(skynet.pack(node_channel[node]))
+end
+
+function command.senders(source)
+	skynet.retpack(node_sender)
 end
 
 local proxy = {}
