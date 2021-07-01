@@ -818,7 +818,7 @@ lmakeindex(lua_State *L) {
 			lua_rawset(L,-3);
 		}
 	}
-	lua_setuservalue(L,1);
+	lua_setiuservalue(L,1,1);
 	lua_settop(L,1);
 
 	return 1;
@@ -862,7 +862,7 @@ replace_object(lua_State *L, int type, struct bson * bs) {
 
 static int
 lreplace(lua_State *L) {
-	lua_getuservalue(L,1);
+	lua_getiuservalue(L,1,1);
 	if (!lua_istable(L,-1)) {
 		return luaL_error(L, "call makeindex first");
 	}
@@ -954,7 +954,7 @@ encode_bson(lua_State *L) {
 	} else {
 		pack_simple_dict(L, b, 0);
 	}
-	void * ud = lua_newuserdata(L, b->size);
+	void * ud = lua_newuserdatauv(L, b->size, 1);
 	memcpy(ud, b->ptr, b->size);
 	return 1;
 }
@@ -984,7 +984,7 @@ encode_bson_byorder(lua_State *L) {
 	lua_settop(L, --n);
 	pack_ordered_dict(L, b, n, 0);
 	lua_settop(L,0);
-	void * ud = lua_newuserdata(L, b->size);
+	void * ud = lua_newuserdatauv(L, b->size, 1);
 	memcpy(ud, b->ptr, b->size);
 	return 1;
 }
@@ -1086,6 +1086,7 @@ lbinary(lua_State *L) {
 	luaL_addchar(&b, 0);
 	luaL_addchar(&b, BSON_BINARY);
 	luaL_addchar(&b, 0);	// sub type
+	lua_pushvalue(L,1);
 	luaL_addvalue(&b);
 	luaL_pushresult(&b);
 
@@ -1245,11 +1246,11 @@ typeclosure(lua_State *L) {
 }
 
 static uint8_t oid_header[5];
-static uint32_t oid_counter;
+static ATOM_ULONG oid_counter;
 
 static void
 init_oid_header() {
-	if (oid_counter) {
+	if (ATOM_LOAD(&oid_counter)) {
 		// already init
 		return;
 	}
@@ -1269,11 +1270,11 @@ init_oid_header() {
 	oid_header[3] = pid & 0xff;
 	oid_header[4] = (pid >> 8) & 0xff;
 	
-	uint32_t c = h ^ time(NULL) ^ (uintptr_t)&h;
+	unsigned long c = h ^ time(NULL) ^ (uintptr_t)&h;
 	if (c == 0) {
 		c = 1;
 	}
-	oid_counter = c;
+	ATOM_STORE(&oid_counter, c);
 }
 
 static inline int

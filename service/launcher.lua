@@ -31,10 +31,10 @@ local function list_srv(ti, fmt_func, ...)
 		req:add(r)
 		sessions[r] = addr
 	end
-	for resp, req in req:select(ti) do
-		local stat = resp[1]
+	for req, resp in req:select(ti) do
 		local addr = req[1]
-		if resp.ok then
+		if resp then
+			local stat = resp[1]
 			list[skynet.address(addr)] = fmt_func(stat, addr)
 		else
 			list[skynet.address(addr)] = fmt_func("ERROR", addr)
@@ -52,7 +52,6 @@ function command.STAT(addr, ti)
 end
 
 function command.KILL(_, handle)
-	handle = handle_to_address(handle)
 	skynet.kill(handle)
 	local ret = { [skynet.address(handle)] = tostring(services[handle]) }
 	services[handle] = nil
@@ -62,8 +61,8 @@ end
 function command.MEM(addr, ti)
 	return list_srv(ti, function(kb, addr)
 		local v = services[addr]
-		if kb == "TIMEOUT" then
-			return string.format("TIMEOUT (%s)",v)
+		if type(kb) == "string" then
+			return string.format("%s (%s)", kb, v)
 		else
 			return string.format("%.2f Kb (%s)",kb,v)
 		end
@@ -74,7 +73,7 @@ function command.GC(addr, ti)
 	for k,v in pairs(services) do
 		skynet.send(k,"debug","GC")
 	end
-	return command.MEM(ti)
+	return command.MEM(addr, ti)
 end
 
 function command.REMOVE(_, handle, kill)

@@ -1,5 +1,6 @@
 -- read https://github.com/cloudwu/skynet/wiki/FAQ for the module "skynet.core"
 local c = require "skynet.core"
+local skynet_require = require "skynet.require"
 local tostring = tostring
 local coroutine = coroutine
 local assert = assert
@@ -65,7 +66,7 @@ local sleep_session = {}
 
 local watching_session = {}
 local error_queue = {}
-local fork_queue = {}
+local fork_queue = { h = 1, t = 0 }
 
 do ---- request/select
 	local function send_requests(self)
@@ -324,11 +325,14 @@ function suspend(co, result, command)
 		session_coroutine_address[co] = nil
 		session_coroutine_tracetag[co] = nil
 		skynet.fork(function() end)	-- trigger command "SUSPEND"
-		error(traceback(co,tostring(command)))
+		local tb = traceback(co,tostring(command))
+		coroutine.close(co)
+		error(tb)
 	end
 	if command == "SUSPEND" then
 		return dispatch_wakeup()
 	elseif command == "QUIT" then
+		coroutine.close(co)
 		-- service exit
 		return
 	elseif command == "USER" then
@@ -409,9 +413,64 @@ end
 function skynet.wait(token)
 	local session = c.genid()
 	token = token or coroutine.running()
-	local ret, msg = suspend_sleep(session, token)
+	suspend_sleep(session, token)
 	sleep_session[token] = nil
 	session_id_coroutine[session] = nil
+end
+
+function skynet.killthread(thread)
+	local session
+	-- find session
+	if type(thread) == "string" then
+		for k,v in pairs(session_id_coroutine) do
+			local thread_string = tostring(v)
+			if thread_string:find(thread) then
+				session = k
+				break
+			end
+		end
+	else
+		local t = fork_queue.t
+		for i = fork_queue.h, t do
+			if fork_queue[i] == thread then
+				table.move(fork_queue, i+1, t, i)
+				fork_queue[t] = nil
+				fork_queue.t = t - 1
+				return thread
+			end
+		end
+		for k,v in pairs(session_id_coroutine) do
+			if v == thread then
+				session = k
+				break
+			end
+		end
+	end
+	local co = session_id_coroutine[session]
+	if co == nil then
+		return
+	end
+	local addr = session_coroutine_address[co]
+	if addr then
+		session_coroutine_address[co] = nil
+		session_coroutine_tracetag[co] = nil
+		c.send(addr, skynet.PTYPE_ERROR, session_coroutine_id[co], "")
+		session_coroutine_id[co] = nil
+	end
+	if watching_session[session] then
+		session_id_coroutine[session] = "BREAK"
+		watching_session[session] = nil
+	else
+		session_id_coroutine[session] = nil
+	end
+	for k,v in pairs(sleep_session) do
+		if v == session then
+			sleep_session[k] = nil
+			break
+		end
+	end
+	coroutine.close(co)
+	return co
 end
 
 function skynet.self()
@@ -461,13 +520,18 @@ function skynet.time()
 end
 
 function skynet.exit()
-	fork_queue = {}	-- no fork coroutine can be execute after skynet.exit
+	fork_queue = { h = 1, t = 0 }	-- no fork coroutine can be execute after skynet.exit
 	skynet.send(".launcher","lua","REMOVE",skynet.self(), false)
 	-- report the sources that call me
 	for co, session in pairs(session_coroutine_id) do
 		local address = session_coroutine_address[co]
 		if session~=0 and address then
 			c.send(address, skynet.PTYPE_ERROR, session, "")
+		end
+	end
+	for session, co in pairs(session_id_coroutine) do
+		if type(co) == "thread" and co ~= running_thread then
+			coroutine.close(co)
 		end
 	end
 	for resp in pairs(unresponse) do
@@ -569,6 +633,9 @@ function skynet.ret(msg, sz)
 	local tag = session_coroutine_tracetag[running_thread]
 	if tag then c.trace(tag, "response") end
 	local co_session = session_coroutine_id[running_thread]
+	if co_session == nil then
+		error "No session"
+	end
 	session_coroutine_id[running_thread] = nil
 	if co_session == 0 then
 		if sz ~= nil then
@@ -577,9 +644,6 @@ function skynet.ret(msg, sz)
 		return false	-- send don't need ret
 	end
 	local co_address = session_coroutine_address[running_thread]
-	if not co_session then
-		error "No session"
-	end
 	local ret = c.send(co_address, skynet.PTYPE_RESPONSE, co_session, msg, sz)
 	if ret then
 		return true
@@ -696,7 +760,9 @@ function skynet.fork(func,...)
 		local args = { ... }
 		co = co_create(function() func(table.unpack(args,1,n)) end)
 	end
-	tinsert(fork_queue, co)
+	local t = fork_queue.t + 1
+	fork_queue.t = t
+	fork_queue[t] = co
 	return co
 end
 
@@ -767,10 +833,18 @@ end
 function skynet.dispatch_message(...)
 	local succ, err = pcall(raw_dispatch_message,...)
 	while true do
-		local co = tremove(fork_queue,1)
-		if co == nil then
+		if fork_queue.h > fork_queue.t then
+			-- queue is empty
+			fork_queue.h = 1
+			fork_queue.t = 0
 			break
 		end
+		-- pop queue
+		local h = fork_queue.h
+		local co = fork_queue[h]
+		fork_queue[h] = nil
+		fork_queue.h = h + 1
+
 		local fork_succ, fork_err = pcall(suspend,co,coroutine_resume(co))
 		if not fork_succ then
 			if succ then
@@ -851,49 +925,16 @@ do
 	}
 end
 
-local init_func = {}
-
-function skynet.init(f, name)
-	assert(type(f) == "function")
-	if init_func == nil then
-		f()
-	else
-		tinsert(init_func, f)
-		if name then
-			assert(type(name) == "string")
-			assert(init_func[name] == nil)
-			init_func[name] = f
-		end
-	end
-end
-
-local function init_all()
-	local funcs = init_func
-	init_func = nil
-	if funcs then
-		for _,f in ipairs(funcs) do
-			f()
-		end
-	end
-end
-
-local function ret(f, ...)
-	f()
-	return ...
-end
-
-local function init_template(start, ...)
-	init_all()
-	init_func = {}
-	return ret(init_all, start(...))
-end
-
-function skynet.pcall(start, ...)
-	return xpcall(init_template, traceback, start, ...)
-end
+skynet.init = skynet_require.init
+-- skynet.pcall is deprecated, use pcall directly
+skynet.pcall = pcall
 
 function skynet.init_service(start)
-	local ok, err = skynet.pcall(start)
+	local function main()
+		skynet_require.init_all()
+		start()
+	end
+	local ok, err = xpcall(main, traceback)
 	if not ok then
 		skynet.error("init service failed: " .. tostring(err))
 		skynet.send(".launcher","lua", "ERROR")
@@ -927,7 +968,9 @@ function skynet.task(ret)
 	if ret == nil then
 		local t = 0
 		for session,co in pairs(session_id_coroutine) do
-			t = t + 1
+			if co ~= "BREAK" then
+				t = t + 1
+			end
 		end
 		return t
 	end
@@ -941,17 +984,24 @@ function skynet.task(ret)
 	local tt = type(ret)
 	if tt == "table" then
 		for session,co in pairs(session_id_coroutine) do
-			if timeout_traceback and timeout_traceback[co] then
-				ret[session] = timeout_traceback[co]
+			local key = string.format("%s session: %d", tostring(co), session)
+			if co == "BREAK" then
+				ret[key] = "BREAK"
+			elseif timeout_traceback and timeout_traceback[co] then
+				ret[key] = timeout_traceback[co]
 			else
-				ret[session] = traceback(co)
+				ret[key] = traceback(co)
 			end
 		end
 		return
 	elseif tt == "number" then
 		local co = session_id_coroutine[ret]
 		if co then
-			return traceback(co)
+			if co == "BREAK" then
+				return "BREAK"
+			else
+				return traceback(co)
+			end
 		else
 			return "No session"
 		end
